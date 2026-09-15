@@ -1,6 +1,6 @@
 import configparser
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import time
 from datetime import datetime
 from pathlib import Path
@@ -89,7 +89,17 @@ def menu():
         choice = input("선택: ").strip()
 
         if choice == "1":
-            run()
+            print("\n[시작 메뉴]")
+            print("1-1. 무한 반복")
+            print("1-2. 설정된 요청 횟수만큼 실행")
+            print("0. 돌아가기")
+            start_choice = input("선택: ").strip()
+            if start_choice == "1-1":
+                run(infinite=True)
+            elif start_choice == "1-2":
+                run(infinite=False)
+            elif start_choice != "0":
+                print("1-1, 1-2, 0 중에서 선택하세요.\n")
         elif choice == "2":
             settings_menu()
         elif choice == "0":
@@ -122,10 +132,12 @@ def check_once(request_id, url, timeout):
         return request_id, int(count.group(1).replace(",", ""))
 
 
-def run():
+def run(infinite=False):
     url, total_requests, max_workers, timeout = load_settings()
     if total_requests < 1 or max_workers < 1 or timeout < 1:
         raise ValueError("요청 수와 동시 실행 수는 1 이상이어야 합니다.")
+
+    target_requests = None if infinite else total_requests
 
     started_at = datetime.now().astimezone()
     started_timer = time.perf_counter()
@@ -140,39 +152,53 @@ def run():
         )
 
     log(
-        f"시작 | 총 {total_requests}회 | "
+        f"시작 | 총 {'무한' if infinite else total_requests}회 | "
         f"최대 동시 실행 {max_workers}개"
     )
 
-    results = []
+    successes = 0
     failures = 0
 
-    executor = ThreadPoolExecutor(
-        max_workers=min(max_workers, total_requests)
-    )
+    executor = ThreadPoolExecutor(max_workers=max_workers)
     futures = {}
+    next_request_id = 1
+    completed = 0
+
+    def submit_next():
+        nonlocal next_request_id
+        if target_requests is not None and next_request_id > target_requests:
+            return False
+        futures[executor.submit(
+            check_once, next_request_id, url, timeout
+        )] = next_request_id
+        next_request_id += 1
+        return True
+
     try:
-        futures = {
-            executor.submit(check_once, i, url, timeout): i
-            for i in range(1, total_requests + 1)
-        }
+        for _ in range(max_workers):
+            if not submit_next():
+                break
 
-        for completed, future in enumerate(as_completed(futures), start=1):
-            request_id = futures[future]
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                request_id = futures.pop(future)
+                completed += 1
 
-            try:
-                _, count = future.result()
-                results.append(count)
-                log(
-                    f"[{completed}/{total_requests}] "
-                    f"요청 #{request_id}: {count:,}회"
-                )
-            except (requests.RequestException, ValueError) as error:
-                failures += 1
-                log(
-                    f"[{completed}/{total_requests}] "
-                    f"요청 #{request_id}: 실패 — {error}"
-                )
+                try:
+                    _, count = future.result()
+                    successes += 1
+                    log(
+                        f"[{completed}/{'∞' if infinite else total_requests}] "
+                        f"요청 #{request_id}: {count:,}회"
+                    )
+                except (requests.RequestException, ValueError) as error:
+                    failures += 1
+                    log(
+                        f"[{completed}/{'∞' if infinite else total_requests}] "
+                        f"요청 #{request_id}: 실패 — {error}"
+                    )
+                submit_next()
     except KeyboardInterrupt:
         print("\n중지 요청을 받았습니다. 대기 중인 요청을 취소합니다.")
         for future in futures:
@@ -183,7 +209,7 @@ def run():
     else:
         executor.shutdown(wait=True)
 
-    log(f"완료 | 성공 {len(results)}건 | 실패 {failures}건")
+    log(f"완료 | 성공 {successes}건 | 실패 {failures}건")
     print(f"시작 시각: {started_at:%Y-%m-%d %H:%M:%S%z}")
     print(f"총 소요 시간: {time.perf_counter() - started_timer:.1f}초")
 
