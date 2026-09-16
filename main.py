@@ -1,5 +1,7 @@
 import configparser
 import re
+import math
+from threading import Event
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import time
 from datetime import datetime
@@ -20,15 +22,16 @@ def load_settings():
             section.getint("total_requests"),
             section.getint("max_workers"),
             section.getint("timeout"),
+            section.getfloat("interval", fallback=0),
         )
     except (KeyError, ValueError) as error:
         raise ValueError(
             "setting.ini의 [settings]에 url, total_requests, "
-            "max_workers, timeout을 올바르게 설정하세요."
+            "max_workers, timeout, interval을 올바르게 설정하세요."
         ) from error
 
 
-def save_settings(url, total_requests, max_workers, timeout):
+def save_settings(url, total_requests, max_workers, timeout, interval=0):
     """실행 설정을 setting.ini에 저장합니다."""
     config = configparser.ConfigParser()
     config["settings"] = {
@@ -36,6 +39,7 @@ def save_settings(url, total_requests, max_workers, timeout):
         "total_requests": str(total_requests),
         "max_workers": str(max_workers),
         "timeout": str(timeout),
+        "interval": str(interval),
     }
     settings_path = Path(__file__).with_name("setting.ini")
     with settings_path.open("w", encoding="utf-8") as settings_file:
@@ -57,14 +61,28 @@ def read_positive_int(prompt, current):
             print("1 이상의 정수를 입력하세요.")
 
 
+def read_interval(current):
+    while True:
+        value = input(f"2-5 요청 간격(초) [{current:g}]: ").strip()
+        if not value:
+            return current
+        try:
+            interval = float(value)
+            if not math.isfinite(interval) or interval < 0:
+                raise ValueError
+            return interval
+        except ValueError:
+            print("0 이상의 숫자를 입력하세요. (예: 0, 0.5, 1)")
+
+
 def settings_menu():
     """설정값을 입력받아 저장합니다."""
     try:
-        url, total_requests, max_workers, timeout = load_settings()
+        url, total_requests, max_workers, timeout, interval = load_settings()
     except (FileNotFoundError, ValueError) as error:
         print(error)
-        url, total_requests, max_workers, timeout = (
-            "https://www.yugiyu5.com/mall/48", 5000, 5, 20
+        url, total_requests, max_workers, timeout, interval = (
+            "https://www.yugiyu5.com/mall/48", 5000, 5, 20, 0
         )
 
     print("\n[설정 메뉴] (Enter를 누르면 현재 값을 유지합니다.)")
@@ -72,9 +90,10 @@ def settings_menu():
     new_total_requests = read_positive_int("2-2 총 요청 수", total_requests)
     new_max_workers = read_positive_int("2-3 동시 실행 수", max_workers)
     new_timeout = read_positive_int("2-4 요청 타임아웃(초)", timeout)
+    new_interval = read_interval(interval)
 
     save_settings(
-        new_url, new_total_requests, new_max_workers, new_timeout
+        new_url, new_total_requests, new_max_workers, new_timeout, new_interval
     )
     print("설정을 저장했습니다.\n")
 
@@ -133,9 +152,11 @@ def check_once(request_id, url, timeout):
 
 
 def run(infinite=False):
-    url, total_requests, max_workers, timeout = load_settings()
+    url, total_requests, max_workers, timeout, interval = load_settings()
     if total_requests < 1 or max_workers < 1 or timeout < 1:
         raise ValueError("요청 수와 동시 실행 수는 1 이상이어야 합니다.")
+    if not math.isfinite(interval) or interval < 0:
+        raise ValueError("요청 간격은 0 이상의 유한한 숫자여야 합니다.")
 
     target_requests = None if infinite else total_requests
 
@@ -153,7 +174,7 @@ def run(infinite=False):
 
     log(
         f"시작 | 총 {'무한' if infinite else total_requests}회 | "
-        f"최대 동시 실행 {max_workers}개"
+        f"최대 동시 실행 {max_workers}개 | 요청 간격 {interval:g}초"
     )
 
     successes = 0
@@ -163,13 +184,19 @@ def run(infinite=False):
     futures = {}
     next_request_id = 1
     completed = 0
+    stop_event = Event()
 
-    def submit_next():
+    def request_after_delay(request_id, delay):
+        if stop_event.wait(delay):
+            return None
+        return check_once(request_id, url, timeout)
+
+    def submit_next(delay=0):
         nonlocal next_request_id
         if target_requests is not None and next_request_id > target_requests:
             return False
         futures[executor.submit(
-            check_once, next_request_id, url, timeout
+            request_after_delay, next_request_id, delay
         )] = next_request_id
         next_request_id += 1
         return True
@@ -198,8 +225,9 @@ def run(infinite=False):
                         f"[{completed}/{'∞' if infinite else total_requests}] "
                         f"요청 #{request_id}: 실패 — {error}"
                     )
-                submit_next()
+                submit_next(interval)
     except KeyboardInterrupt:
+        stop_event.set()
         print("\n중지 요청을 받았습니다. 대기 중인 요청을 취소합니다.")
         for future in futures:
             future.cancel()
